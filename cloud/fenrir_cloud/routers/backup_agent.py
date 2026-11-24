@@ -15,7 +15,7 @@ import uuid as uuidlib
 from types import SimpleNamespace
 
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, Request, Response
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -78,6 +78,8 @@ def enroll(body: dict = Body(...), db: Session = Depends(get_db)):
             raise HTTPException(403, "the deployment token has expired or was revoked")
         if fet.include_backup is False:
             raise HTTPException(409, "device backup is not included in this deployment")
+        if role == "recovery":
+            raise HTTPException(403, "recovery sessions enrol with a recovery media link")
         tok = SimpleNamespace(id=fet.id, tenant_id=fet.tenant_id, device_id=None, label="bundled", uses=0, revoked=False)
     else:
         tok = db.execute(select(BackupEnrollment).where(BackupEnrollment.token_hash == bk.token_hash(raw))).scalars().first()
@@ -85,6 +87,9 @@ def enroll(body: dict = Body(...), db: Session = Depends(get_db)):
             raise HTTPException(403, "enrollment token not recognised")
         if tok.revoked or tok.expires_at < utcnow():
             raise HTTPException(403, "enrollment token has expired or was revoked; create a new download")
+        # Recovery media links enrol recovery sessions only, and recovery sessions need one.
+        if (tok.role == "recovery") != (role == "recovery"):
+            raise HTTPException(403, "this enrollment token is for recovery media only, or this agent needs one")
 
     agent_token = bk.new_token()
     os_ = body.get("os") if isinstance(body.get("os"), dict) else {}
@@ -114,7 +119,7 @@ def enroll(body: dict = Body(...), db: Session = Depends(get_db)):
         db.add(agent)
         db.flush()
         action = "backup.agent.enrolled"
-    if agent.device_id is None:
+    if agent.device_id is None and role != "recovery":
         agent.device_id = bk.matching_device(db, agent)
     tok.uses += 1
     if tok.label.startswith("push:"):
@@ -124,18 +129,42 @@ def enroll(body: dict = Body(...), db: Session = Depends(get_db)):
     return {"agent_id": agent.id, "agent_token": agent_token, "poll_seconds": bk.POLL_SECONDS}
 
 
+def _access(db: Session, agent: BackupAgent, repo_id: str) -> dict | None:
+    """A repository's access sealed to this agent, as the agent receives it. None: no access."""
+    repo = db.get(BackupRepository, repo_id)
+    access = db.get(BackupRepoAccess, (repo_id, agent.id))
+    if repo is None or access is None:
+        return None
+    out = {"repository_id": repo.id, "path": repo.path, "sealed_secret": access.sealed,
+           "gateway": gw.route(db, repo, access), "sealed_share": access.sealed_share}
+    if repo.s3:
+        out["s3"] = repo.s3
+    return out
+
+
 def _job_spec(db: Session, agent: BackupAgent, job: BackupJob) -> dict | None:
-    """The job as the agent receives it, with the sealed repository access. None: no access."""
+    """The job as the agent receives it, with the sealed repository access. None: no access (to the repository, or to
+    a copy's destination)."""
     repository = None
     if job.repository_id:
-        repo = db.get(BackupRepository, job.repository_id)
-        access = db.get(BackupRepoAccess, (job.repository_id, agent.id))
-        if repo is None or access is None:
+        repository = _access(db, agent, job.repository_id)
+        if repository is None:
             return None
-        repository = {"repository_id": repo.id, "path": repo.path, "sealed_secret": access.sealed,
-                      "gateway": gw.route(db, repo, access),
-                      "sealed_share": access.sealed_share}
-    return {"id": job.id, "kind": job.kind, "repository": repository}
+    kind = dict(job.kind or {})
+    unlock = kind.pop("unlock", None)
+    if isinstance(unlock, dict) and repository is not None:
+        # A passphrase check (console unlock): the machine opens the repository with the passphrase just typed,
+        # sealed to it in the browser, instead of the one it was given.
+        if not unlock.get("sealed"):
+            return None
+        repository = {**repository, "sealed_secret": unlock["sealed"]}
+    spec = {"id": job.id, "kind": kind, "repository": repository}
+    if (job.kind or {}).get("type") == "copy_images":
+        target = _access(db, agent, str(job.kind.get("target_repository_id") or ""))
+        if target is None:
+            return None
+        spec["copy_target"] = target
+    return spec
 
 
 @router.post("/api/agent/heartbeat")
@@ -203,6 +232,49 @@ def _record_boot_check(db: Session, job: BackupJob, agent: BackupAgent, b: dict)
 IMAGE_INT_FIELDS = ("captured_bytes", "stored_new_bytes", "chunks_total", "chunks_new", "bytes_new_raw")
 
 
+def _applications(v) -> list | None:
+    """The image's application components (VSS writers), rebuilt from known fields only, bounded."""
+    if not isinstance(v, list) or not v:
+        return None
+    out = []
+    for a in v[:500]:
+        if isinstance(a, dict):
+            out.append({"writer": _str(a.get("writer"), 200), "component": _str(a.get("component"), 500),
+                        "caption": _str(a.get("caption"), 300), "included": bool(a.get("included")),
+                        "note": _str(a.get("note"), 500) or None})
+    return out or None
+
+
+@router.post("/api/agent/jobs/{job_id}/download")
+async def upload_download(job_id: str, offset: int, request: Request, agent: BackupAgent = Depends(current_backup_agent),
+                          db: Session = Depends(get_db)):
+    """The agent appends to the encrypted stream of its download_files job (backup/docs/design/file-download.md).
+    Uploads carry their offset, so a retried request is harmless; a gap is refused. Ciphertext only."""
+    job = db.get(BackupJob, job_id)
+    if job is None:
+        raise HTTPException(404, "unknown job")
+    if job.agent_id != agent.id:
+        raise HTTPException(403, "job belongs to another agent")
+    if (job.kind or {}).get("type") != "download_files" or job.state in bk.FINAL_STATES:
+        raise HTTPException(409, "not a running download")
+    body = await request.body()
+    if len(body) > 16 << 20 or offset < 0:
+        raise HTTPException(413, "upload in smaller parts")
+    path = bk.download_path(job.id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    have = path.stat().st_size if path.exists() else 0
+    end = offset + len(body)
+    if end > bk.DOWNLOAD_MAX:
+        raise HTTPException(400, "the download is too large")
+    if offset > have:
+        raise HTTPException(409, f"expected offset {have}")
+    if end > have:
+        with open(path, "r+b" if path.exists() else "wb") as f:
+            f.seek(offset)
+            f.write(body)
+    return {"have": max(end, have)}
+
+
 @router.post("/api/agent/jobs/{job_id}/update")
 def update_job(job_id: str, body: dict = Body(...), agent: BackupAgent = Depends(current_backup_agent),
                db: Session = Depends(get_db)):
@@ -234,15 +306,19 @@ def update_job(job_id: str, body: dict = Body(...), agent: BackupAgent = Depends
 
     repo = db.get(BackupRepository, job.repository_id) if job.repository_id else None
     images = body.get("images") or []
-    if repo is not None:
+    # A copy reports the images it put in its destination.
+    image_repo = db.get(BackupRepository, str(kind.get("target_repository_id"))) \
+        if kind.get("type") == "copy_images" else repo
+    if image_repo is not None:
         for im in images:
             if db.get(BackupImage, str(im["image_id"])) is not None:
                 continue
-            row = BackupImage(image_id=str(im["image_id"]), repository_id=repo.id, tenant_id=repo.tenant_id,
+            row = BackupImage(image_id=str(im["image_id"]), repository_id=image_repo.id, tenant_id=image_repo.tenant_id,
                               agent_id=agent.id, machine_id=_str(im.get("machine_id"), 200),
                               hostname=_str(im.get("hostname"), 255), created_unix=int(im.get("created_unix") or 0),
                               kind=_str(im.get("kind"), 20), consistency=_str(im.get("consistency"), 30),
                               disks=im.get("disks") or [], label=im.get("label"), vm_name=im.get("vm_name"),
+                              applications=_applications(im.get("applications")),
                               **{f: int(im.get(f) or 0) for f in IMAGE_INT_FIELDS})
             db.add(row)
             db.flush()
@@ -273,6 +349,20 @@ def update_job(job_id: str, body: dict = Body(...), agent: BackupAgent = Depends
                 bk.raise_alert(db, job.tenant_id, agent.device_id, bk.RULE_BOOT,
                                f"Backup of {name} did not boot", "high",
                                f"A boot check of image {kind.get('image_id')} failed: {_str(b.get('message'), 500)}")
+        if kind.get("type") == "list_images" and final and repo.status == "pending" and not repo.repo_uuid:
+            # Adopting an existing repository: the machine reports its ID with the listing.
+            got = str(body.get("repo_uuid") or "")
+            dup = db.execute(select(BackupRepository).where(BackupRepository.tenant_id == repo.tenant_id,
+                                                           BackupRepository.repo_uuid == got,
+                                                           BackupRepository.id != repo.id)).scalars().first() if got else None
+            if state not in ("succeeded", "warning"):
+                repo.status, repo.status_message = "failed", job.error
+            elif not got:
+                repo.status, repo.status_message = "failed", "the machine did not report the repository's ID; update its agent"
+            elif dup is not None:
+                repo.status, repo.status_message = "failed", f"this repository is already registered as {dup.name}"
+            else:
+                repo.repo_uuid, repo.status, repo.status_message = got, "ready", None
         if kind.get("type") == "init_repository" and final:
             if state in ("succeeded", "warning"):
                 ok = str(body.get("repo_uuid") or "") == repo.repo_uuid
@@ -282,11 +372,19 @@ def update_job(job_id: str, body: dict = Body(...), agent: BackupAgent = Depends
                 repo.status, repo.status_message = "failed", job.error
     # Retention runs after each successful plan backup (held repositories wait).
     if bk.is_backup(kind) and state in ("succeeded", "warning") and job.plan_id and repo is not None:
+        bk.queue_copy(db, job.plan_id, repo.id, agent, images)
         bk.queue_retention(db, job.plan_id, repo.id, agent, images)
     if state == "failed" and kind.get("type") not in ("check_access", "list_images", "browse_files"):
         bk.raise_alert(db, job.tenant_id, agent.device_id, bk.RULE_FAILED, f"{bk.label(kind)} failed: {name}",
                        "high" if bk.is_backup(kind) or kind.get("type") == "restore" else "medium",
                        f"{bk.label(kind)} on {name} failed. {job.error or ''}".strip())
+    if final and isinstance(kind.get("unlock"), dict):
+        # The typed passphrase is no longer needed once checked.
+        job.kind = {**kind, "unlock": {"user": kind["unlock"].get("user")}}
+        if repo is not None:
+            bk.record(db, f"backup-agent:{agent.id}",
+                      "backup.repository.unlocked" if state in ("succeeded", "warning") else "backup.repository.unlock_failed",
+                      repo.name, repo.tenant_id, job=job.id)
     if final:
         bk.record(db, f"backup-agent:{agent.id}", f"backup.job.{state}", job.id, job.tenant_id, kind=kind.get("type"))
     db.commit()
@@ -352,6 +450,29 @@ def setup_program(token: str, platform: str, file: str, request: Request, db: Se
     data = bk.setup_exe(exe, server_url(request), tls_pin(), token, p["role"] or tok.role)
     return Response(data, media_type="application/vnd.microsoft.portable-executable",
                     headers={"Content-Disposition": f'attachment; filename="{file}"', "Cache-Control": "no-store"})
+
+
+@router.get("/recovery/{token}/{file}")
+def recovery_media(token: str, file: str, request: Request, db: Session = Depends(get_db)):
+    """fenrir-recovery.iso with this server's settings in its placeholder block, or the same settings as
+    fenrir-recovery.json for a USB stick. The link is a recovery enrolment token."""
+    tok = enrollment_for(db, token)
+    if tok.role != "recovery":
+        raise HTTPException(404, "This link is not for recovery media.")
+    cfg = bk.recovery_settings(server_url(request), tls_pin(), token, tok.expires_at)
+    if file == bk.RECOVERY_SETTINGS:
+        return JSONResponse(cfg, headers={"Content-Disposition": f'attachment; filename="{file}"', "Cache-Control": "no-store"})
+    if file != bk.RECOVERY_ISO:
+        raise HTTPException(404, "no such file")
+    path = bk.recovery_iso_path()
+    if not path.is_file():
+        raise HTTPException(503, "The recovery ISO is not on this server yet.")
+    offset = bk.recovery_block_offset(path)
+    if offset is None:
+        raise HTTPException(500, "The recovery ISO on this server has no settings block.")
+    return StreamingResponse(bk.personalised_iso(path, offset, bk.recovery_block(cfg)), media_type="application/octet-stream",
+                             headers={"Content-Disposition": f'attachment; filename="{file}"', "Cache-Control": "no-store",
+                                      "Content-Length": str(path.stat().st_size)})
 
 
 @router.get("/uninstall/{platform}")

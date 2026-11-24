@@ -6,7 +6,8 @@
 //! The FFI lives in `win` and only builds on Windows; the parsing and disk
 //! composition logic is portable and unit-tested on every platform.
 
-pub mod composite;
+pub use engine::composite;
+pub mod apps;
 pub mod parse;
 
 #[cfg(windows)]

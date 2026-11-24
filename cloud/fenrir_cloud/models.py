@@ -3014,6 +3014,9 @@ class BackupRepository(Base):
     share_user: Mapped[str | None] = mapped_column(String(200), nullable=True)
     # NAS gateway: the agent that serves this repository to machines that cannot reach it (append-only for them).
     gateway_agent_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    # S3-compatible storage (path s3://bucket/prefix): endpoint, region, path_style, lock_mode, lock_days. Not secret;
+    # the access keys are sealed per agent like a share sign-in.
+    s3: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
 
 class BackupRepoAccess(Base):
@@ -3042,6 +3045,8 @@ class ImageBackupPlan(Base):
     job: Mapped[dict] = mapped_column(JSON)  # protocol JobKind
     schedule: Mapped[dict] = mapped_column(JSON)  # interval | daily | manual
     retention: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Off-site copy: after each backup the machine copies the new images to this repository too.
+    copy_to_repository_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     next_run_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_run_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -3090,6 +3095,8 @@ class BackupImage(Base):
     chunks_new: Mapped[int] = mapped_column(BigInteger, default=0)
     bytes_new_raw: Mapped[int] = mapped_column(BigInteger, default=0)
     anomaly: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Application components coordinated with the snapshot (Windows VSS writers), as the agent reports them.
+    applications: Mapped[list | None] = mapped_column(JSON, nullable=True)
 
 
 class BackupBootCheck(Base):

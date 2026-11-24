@@ -185,6 +185,7 @@ fn engine_backs_up_only_allocated_blocks() {
         label: None,
         warnings: vec![],
         vm: None,
+        applications: vec![],
     };
     let r = engine::backup(
         &repo,
@@ -245,6 +246,7 @@ fn restore_image_as_vhdx() {
         label: None,
         warnings: vec![],
         vm: None,
+        applications: vec![],
     };
     let r = engine::backup(
         &repo,
@@ -274,6 +276,8 @@ fn restore_image_as_vhdx() {
         &engine::RestoreOptions {
             workers: 3,
             zero_fill: false,
+            fit: false,
+            grow: false,
         },
         &engine::JobControl::new(),
         &|_, _| {},

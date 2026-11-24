@@ -121,6 +121,7 @@ fn meta() -> ImageMeta {
         label: None,
         warnings: vec![],
         vm: None,
+        applications: vec![],
     }
 }
 
@@ -660,4 +661,194 @@ fn stats_record_raw_and_stored_bytes_of_new_data() {
     let r = run_backup(&repo, &disk).unwrap();
     assert_eq!(r.stats.bytes_new_raw, r.stats.chunks_new * MIB);
     assert!(r.stats.bytes_new_stored < r.stats.bytes_new_raw);
+}
+
+/// Storage with object locks (S3 Object Lock): deletes of locked objects
+/// are refused, locks are extended.
+struct LockedBackend {
+    inner: LocalBackend,
+    locked: std::sync::Mutex<std::collections::HashSet<String>>,
+    extended: std::sync::Mutex<Vec<String>>,
+}
+
+impl Backend for LockedBackend {
+    fn put(&self, key: &str, data: &[u8]) -> core_format::Result<PutOutcome> {
+        if !key.starts_with("locks/") {
+            self.locked.lock().unwrap().insert(key.to_string());
+        }
+        self.inner.put(key, data)
+    }
+    fn get(&self, key: &str) -> core_format::Result<Vec<u8>> {
+        self.inner.get(key)
+    }
+    fn exists(&self, key: &str) -> core_format::Result<bool> {
+        self.inner.exists(key)
+    }
+    fn list(&self, prefix: &str) -> core_format::Result<Vec<String>> {
+        self.inner.list(prefix)
+    }
+    fn delete(&self, key: &str) -> core_format::Result<()> {
+        if self.locked.lock().unwrap().contains(key) {
+            return Err(core_format::Error::Retained(key.to_string()));
+        }
+        self.inner.delete(key)
+    }
+    fn describe(&self) -> String {
+        "locked".into()
+    }
+    fn lock_days(&self) -> Option<u32> {
+        Some(30)
+    }
+    fn extend_lock(&self, key: &str) -> core_format::Result<bool> {
+        self.extended.lock().unwrap().push(key.to_string());
+        Ok(true)
+    }
+}
+
+#[test]
+fn object_locks_keep_objects_until_they_expire_and_are_extended() {
+    use engine::retention::{forget, prune, RetentionPolicy};
+    let dir = tempfile::tempdir().unwrap();
+    drop(new_repo(dir.path()));
+    let lb = Arc::new(LockedBackend {
+        inner: LocalBackend::open(dir.path().join("repo")).unwrap(),
+        locked: Default::default(),
+        extended: Default::default(),
+    });
+    let b: Arc<dyn Backend> = lb.clone();
+    let repo = Repository::unlock_with_passphrase(b, b"pw").unwrap();
+    let disk = make_disk();
+    let mut ids = vec![];
+    for round in 0..2u8 {
+        let off = ((6 + round as u64) * MIB) as usize;
+        disk.data.write().unwrap()[off..off + MIB as usize]
+            .copy_from_slice(&pattern(200 + round as u64, MIB as usize));
+        ids.push(run_backup(&repo, &disk).unwrap().image_id);
+    }
+    let keep_last = RetentionPolicy {
+        keep_last: 1,
+        ..Default::default()
+    };
+    // Every object was written by this backend, so every one is locked.
+    let r = forget(&repo, &[], &keep_last, false).unwrap();
+    assert!(r.removed.is_empty());
+    assert_eq!(
+        r.retained,
+        vec![ids[0]],
+        "the old image stays until its lock expires"
+    );
+    assert_eq!(repo.list_image_ids().unwrap().len(), 2);
+
+    // The lock expires: the next run removes it.
+    lb.locked.lock().unwrap().clear();
+    let r = forget(&repo, &[], &keep_last, false).unwrap();
+    assert_eq!(r.removed, vec![ids[0]]);
+
+    // Chunks only the old image used: kept while locked, and everything
+    // still used gets its lock extended.
+    for k in repo.backend().list("chunks").unwrap() {
+        lb.locked.lock().unwrap().insert(k);
+    }
+    let p = prune(&repo, false, &JobControl::new()).unwrap();
+    assert_eq!(p.chunks_deleted, 0);
+    assert!(p.chunks_retained >= 1, "{p:?}");
+    let ext = lb.extended.lock().unwrap().clone();
+    assert!(ext.contains(&"config.json".to_string()));
+    assert!(ext.contains(&format!("manifests/{}", ids[1])));
+    let m = repo.load_manifest(&ids[1]).unwrap();
+    for c in m.chunk_ids() {
+        assert!(
+            ext.contains(&c.object_key()),
+            "chunk {} in use is extended",
+            c.object_key()
+        );
+    }
+    assert_eq!(p.locks_extended, ext.len());
+    // A dry run neither deletes nor extends.
+    lb.extended.lock().unwrap().clear();
+    prune(&repo, true, &JobControl::new()).unwrap();
+    assert!(lb.extended.lock().unwrap().is_empty());
+    // Expired: now reclaimed, and the remaining image is intact.
+    lb.locked.lock().unwrap().clear();
+    let p = prune(&repo, false, &JobControl::new()).unwrap();
+    assert!(p.chunks_deleted >= 1 && p.chunks_retained == 0);
+    assert!(
+        verify(&repo, None, VerifyLevel::Full, &JobControl::new(), 2)
+            .unwrap()
+            .ok
+    );
+}
+
+#[test]
+fn copy_to_another_repository_restores_identically() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = new_repo(&dir.path().join("a"));
+    let dst = new_repo(&dir.path().join("b"));
+    let disk = make_disk();
+    let first = run_backup(&src, &disk).unwrap();
+    disk.data.write().unwrap()[(7 * MIB) as usize..(7 * MIB) as usize + 4096].fill(0xAB);
+    let second = run_backup(&src, &disk).unwrap();
+    // A copy has its own ID in each destination, derived from the source image.
+    let id_in = |r: &Repository, id: Uuid| engine::copy::copy_id(r.config().repo_id, id);
+
+    let r =
+        engine::copy::copy_images(&src, &dst, None, true, &JobControl::new(), &|_, _| {}).unwrap();
+    assert_eq!(
+        r.copied,
+        vec![id_in(&dst, first.image_id), id_in(&dst, second.image_id)],
+        "oldest first"
+    );
+    assert!(r.verified);
+    let total: usize = src
+        .load_manifest(&second.image_id)
+        .unwrap()
+        .disks
+        .iter()
+        .map(|d| d.chunks.len())
+        .sum();
+    assert!(
+        r.chunks_written > 0 && (r.chunks_written as usize) < 2 * total,
+        "shared chunks once"
+    );
+    // The copy keeps the chain and restores to the same bytes as the source.
+    let copied = dst.load_manifest(&id_in(&dst, second.image_id)).unwrap();
+    assert_eq!(copied.parent, Some(id_in(&dst, first.image_id)));
+    assert_eq!(copied.repo_id, dst.config().repo_id);
+    let (a, b) = (
+        dir.path().join("from-src.img"),
+        dir.path().join("from-dst.img"),
+    );
+    restore_to(&src, second.image_id, &a);
+    restore_to(&dst, id_in(&dst, second.image_id), &b);
+    assert_eq!(std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
+    // Different keys: the destination's chunk objects are not the source's.
+    let names = |r: &Repository| -> std::collections::HashSet<String> {
+        r.backend().list("chunks/").unwrap().into_iter().collect()
+    };
+    assert!(names(&src).is_disjoint(&names(&dst)));
+
+    // Again: nothing to do.
+    let r =
+        engine::copy::copy_images(&src, &dst, None, false, &JobControl::new(), &|_, _| {}).unwrap();
+    assert!(r.copied.is_empty() && r.already_there == 2 && r.chunks_written == 0);
+    // Only the newest, into a third repository: it stands alone there.
+    let third = new_repo(&dir.path().join("c"));
+    let r = engine::copy::copy_images(
+        &src,
+        &third,
+        Some(&[second.image_id]),
+        false,
+        &JobControl::new(),
+        &|_, _| {},
+    )
+    .unwrap();
+    assert_eq!(r.copied, vec![id_in(&third, second.image_id)]);
+    let alone = third
+        .load_manifest(&id_in(&third, second.image_id))
+        .unwrap();
+    assert_eq!((alone.parent, alone.kind), (None, ImageKind::Full));
+    // Not into itself.
+    assert!(
+        engine::copy::copy_images(&src, &src, None, false, &JobControl::new(), &|_, _| {}).is_err()
+    );
 }

@@ -16,6 +16,8 @@ import os
 import re
 import secrets
 import struct
+import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -34,7 +36,9 @@ POLL_SECONDS = 15
 LOST_AFTER = timedelta(seconds=180)
 ACTIVE_STATES = ("queued", "dispatched", "running")
 FINAL_STATES = ("succeeded", "warning", "failed", "cancelled")
-ROLES = ("workstation", "server", "hyperv")
+ROLES = ("workstation", "server", "hyperv", "recovery")
+# Roles an installer can enrol; "recovery" is only for recovery media.
+INSTALL_ROLES = ("workstation", "server", "hyperv")
 MAX_SCREENSHOT = 4 << 20
 
 # Alert rules (Alert.rule_id) raised into the normal alert queue.
@@ -69,9 +73,9 @@ BACKUP_KINDS = ("backup_system", "backup_disks", "backup_hyperv")
 KIND_LABELS = {
     "init_repository": "Create repository", "backup_system": "System backup", "backup_disks": "Disk backup",
     "backup_hyperv": "Hyper-V backup", "verify": "Verify", "list_images": "Refresh images",
-    "apply_retention": "Apply retention", "prune": "Reclaim space", "restore": "Restore", "boot_check": "Boot check",
+    "apply_retention": "Apply retention", "copy_images": "Copy off-site", "prune": "Reclaim space", "restore": "Restore", "boot_check": "Boot check",
     "stop_vm": "Stop VM", "check_access": "Test connection", "browse_files": "Browse files",
-    "restore_files": "Restore files",
+    "restore_files": "Restore files", "download_files": "Download files",
 }
 # Capability the agent must report for console-created jobs of each kind.
 KIND_CAPABILITY = {"backup_system": "backup_system", "backup_disks": "backup_disks", "backup_hyperv": "backup_hyperv",
@@ -79,6 +83,8 @@ KIND_CAPABILITY = {"backup_system": "backup_system", "backup_disks": "backup_dis
 
 
 def label(kind: dict | None) -> str:
+    if (kind or {}).get("unlock"):
+        return "Passphrase check"
     return KIND_LABELS.get((kind or {}).get("type", ""), "Job")
 
 
@@ -102,8 +108,11 @@ def _parse_hm(value: str) -> tuple[int, int] | None:
 def validate_schedule(s: dict) -> None:
     kind = s.get("type")
     if kind == "interval":
-        if not isinstance(s.get("hours"), int) or not 1 <= s["hours"] <= 24 * 31:
-            raise ValueError("interval must be 1 hour to 31 days")
+        # Hours and minutes (frequent backups, Fenrir-Backup frequent-backups.md): 5 minutes to 31 days.
+        hours, minutes = s.get("hours", 0), s.get("minutes", 0)
+        if not isinstance(hours, int) or not isinstance(minutes, int) or not 0 <= minutes < 60 or hours < 0 \
+                or not 5 <= hours * 60 + minutes <= 31 * 24 * 60:
+            raise ValueError("interval must be 5 minutes to 31 days")
     elif kind == "daily":
         if _parse_hm(s.get("time", "")) is None:
             raise ValueError("time must be HH:MM")
@@ -119,7 +128,7 @@ def next_after(s: dict, after: int) -> int | None:
     """First run time strictly after `after` (Unix seconds)."""
     kind = s.get("type")
     if kind == "interval":
-        return after + int(s["hours"]) * 3600
+        return after + int(s.get("hours", 0)) * 3600 + int(s.get("minutes", 0)) * 60
     if kind != "daily":
         return None
     hm = _parse_hm(s.get("time", ""))
@@ -139,7 +148,7 @@ def next_after(s: dict, after: int) -> int | None:
     return None
 
 
-RETENTION_FIELDS = ("keep_last", "keep_daily", "keep_weekly", "keep_monthly", "keep_yearly")
+RETENTION_FIELDS = ("keep_last", "keep_hourly", "keep_daily", "keep_weekly", "keep_monthly", "keep_yearly")
 
 
 def keeps_everything(r: dict | None) -> bool:
@@ -220,6 +229,34 @@ PLATFORMS = {
     "macos": {"name": "macOS", "targets": MAC, "role": None, "script": "install-fenrir-backup-macos.sh", "setup": None},
 }
 ALL_TARGETS = {t.triple: t for p in PLATFORMS.values() for t in p["targets"]}
+
+
+# Encrypted file downloads waiting for the browser (backup/docs/design/file-download.md): kept a day.
+DOWNLOAD_MAX = (4 << 30) + (64 << 20)
+
+
+def downloads_dir() -> Path:
+    from .config import get_settings
+
+    return Path(get_settings().artifact_dir) / "backup-downloads"
+
+
+def download_path(job_id: str) -> Path:
+    return downloads_dir() / f"{uuid.UUID(job_id)}.bin"
+
+
+def purge_downloads(max_age_seconds: int = 86_400) -> int:
+    d, n = downloads_dir(), 0
+    if not d.is_dir():
+        return 0
+    for f in d.iterdir():
+        try:
+            if time.time() - f.stat().st_mtime >= max_age_seconds:
+                f.unlink()
+                n += 1
+        except OSError:
+            pass
+    return n
 
 
 def agents_dir() -> Path:
@@ -353,6 +390,16 @@ def check_anomaly(db: Session, repo_id: str, im: dict) -> str | None:
     return evaluate_anomaly(hist, cur)
 
 
+def queue_copy(db: Session, plan_id: str, repo_id: str, agent: BackupAgent, images: list[dict]) -> None:
+    """The plan's off-site copy of the images just taken, on the same machine (Fenrir-Backup offsite-copy.md)."""
+    plan = db.get(ImageBackupPlan, plan_id)
+    ids = [str(i["image_id"]) for i in images if i.get("image_id")]
+    if plan is None or not plan.copy_to_repository_id or not ids:
+        return
+    queue(db, agent, {"type": "copy_images", "target_repository_id": plan.copy_to_repository_id, "images": ids,
+                      "full_verify": False}, repo_id, "copy", plan_id=plan_id)
+
+
 def queue_retention(db: Session, plan_id: str, repo_id: str, agent: BackupAgent, images: list[dict]) -> None:
     plan = db.get(ImageBackupPlan, plan_id)
     if plan is None or keeps_everything(plan.retention):
@@ -460,7 +507,8 @@ def check_health(db: Session) -> None:
     """Alerts for backup agents that stopped checking in and machines whose plan has not succeeded for too long;
     resolved automatically when they recover."""
     now = utcnow()
-    for agent in db.execute(select(BackupAgent).where(BackupAgent.revoked.is_(False))).scalars().all():
+    for agent in db.execute(select(BackupAgent).where(BackupAgent.revoked.is_(False),
+                                                      BackupAgent.role != "recovery")).scalars().all():
         name = agent.display_name or agent.hostname
         key = f"offline:{agent.id}"
         if agent.last_seen_at is not None and now - agent.last_seen_at > timedelta(hours=24):
@@ -487,9 +535,98 @@ def check_health(db: Session) -> None:
 
 
 def tick(db: Session) -> None:
-    """30-second scheduler: plans, boot verification."""
+    """30-second scheduler: plans, boot verification, ended recovery sessions."""
     run_due_plans(db)
     run_boot_checks(db)
+    expire_recovery_sessions(db)
+    purge_downloads()
+
+
+# --------------------------------------------------------------------------
+# Recovery media (Fenrir-Backup docs/design/phase-2.md)
+# --------------------------------------------------------------------------
+
+RECOVERY_ISO = "fenrir-recovery.iso"
+RECOVERY_SETTINGS = "fenrir-recovery.json"
+RECOVERY_MARKER = b"FENRIR-RECOVERY-CONFIG-V1\n"
+RECOVERY_BLOCK = 4096
+RECOVERY_SESSION_KEEP = timedelta(days=7)
+
+
+def recovery_iso_path() -> Path:
+    """The stock recovery ISO from the Fenrir-Backup build (recovery-env/build.sh)."""
+    return agents_dir() / "recovery" / RECOVERY_ISO
+
+
+def recovery_settings(server: str, pin: str, token: str, expires: datetime) -> dict:
+    """Same fields and order as protocol::recovery::RecoveryConfig."""
+    return {"server": server, "pin": pin, "token": token,
+            "expires": int(expires.replace(tzinfo=timezone.utc).timestamp())}
+
+
+def recovery_block(cfg: dict) -> bytes:
+    """protocol::recovery::render: marker, compact JSON, newline, spaces to 4 KiB."""
+    b = RECOVERY_MARKER + json.dumps(cfg, separators=(",", ":")).encode() + b"\n"
+    if len(b) > RECOVERY_BLOCK:
+        raise ValueError("recovery settings do not fit in 4 KiB")
+    return b + b" " * (RECOVERY_BLOCK - len(b))
+
+
+_ISO_BLOCKS: dict[Path, tuple[float, int, int | None]] = {}
+
+
+def recovery_block_offset(path: Path) -> int | None:
+    """Where the unconfigured placeholder block is in the ISO (on a 2048-byte sector), cached per file version."""
+    st = path.stat()
+    hit = _ISO_BLOCKS.get(path)
+    if hit and hit[:2] == (st.st_mtime, st.st_size):
+        return hit[2]
+    placeholder = RECOVERY_MARKER + b" " * (RECOVERY_BLOCK - len(RECOVERY_MARKER))
+    found, off, pending = None, 0, None
+    with open(path, "rb") as f:
+        while True:
+            sector = f.read(2048)
+            if len(sector) < 2048:
+                break
+            if pending is not None and pending[1] + sector == placeholder:
+                found = pending[0]
+                break
+            pending = (off, sector) if sector.startswith(RECOVERY_MARKER) else None
+            off += 2048
+    _ISO_BLOCKS[path] = (st.st_mtime, st.st_size, found)
+    return found
+
+
+def personalised_iso(path: Path, offset: int, block: bytes, chunk: int = 1 << 20):
+    """The ISO's bytes with the placeholder replaced by `block`."""
+    with open(path, "rb") as f:
+        pos = 0
+        while True:
+            data = f.read(chunk)
+            if not data:
+                return
+            s, e = max(offset, pos), min(offset + len(block), pos + len(data))
+            if s < e:
+                data = data[:s - pos] + block[s - offset:e - offset] + data[e - pos:]
+            yield data
+            pos += len(data)
+
+
+def expire_recovery_sessions(db: Session) -> int:
+    """Recovery sessions (machines started from recovery media) not seen for a week are removed with their access."""
+    cutoff = utcnow() - RECOVERY_SESSION_KEEP
+    n = 0
+    for a in db.execute(select(BackupAgent).where(BackupAgent.role == "recovery", BackupAgent.revoked.is_(False),
+                                                  BackupAgent.last_seen_at < cutoff)).scalars().all():
+        a.revoked = True
+        for x in db.execute(select(BackupRepoAccess).where(BackupRepoAccess.agent_id == a.id)).scalars():
+            db.delete(x)
+        for j in db.execute(select(BackupJob).where(BackupJob.agent_id == a.id, BackupJob.state == "queued")).scalars():
+            j.state, j.finished_at, j.error = "cancelled", utcnow(), "recovery session ended"
+        record(db, "system", "backup.recovery_session.expired", a.hostname, a.tenant_id)
+        n += 1
+    db.commit()
+    return n
 
 
 BROWSE_KEEP = timedelta(days=1)
@@ -499,10 +636,12 @@ FAST_POLL_FOR = timedelta(minutes=3)
 
 
 def poll_seconds(db: Session, agent: BackupAgent) -> int:
-    recent = db.execute(select(BackupJob.id).where(
+    """Every second while someone browses this machine's backups or waits for it to check a passphrase."""
+    recent = db.execute(select(BackupJob.kind).where(
         BackupJob.agent_id == agent.id, BackupJob.created_at > utcnow() - FAST_POLL_FOR,
-        BackupJob.kind["type"].as_string() == "browse_files")).first()
-    return FAST_POLL_SECONDS if recent else POLL_SECONDS
+        BackupJob.kind["type"].as_string().in_(("browse_files", "list_images")))).scalars().all()
+    fast = any(k.get("type") == "browse_files" or k.get("unlock") for k in recent if isinstance(k, dict))
+    return FAST_POLL_SECONDS if fast else POLL_SECONDS
 
 
 def purge_listings(db: Session) -> int:
@@ -517,14 +656,33 @@ def purge_listings(db: Session) -> int:
     return n
 
 
+def _serial(s: str | None) -> str:
+    """A hardware serial number fit to identify a machine ('' for firmware placeholders)."""
+    v = (s or "").strip().lower()
+    junk = len(v) < 3 or any(x in v for x in ("o.e.m", "default", "not specified", "serial number", "none")) \
+        or all(c in "0-. " for c in v)
+    return "" if junk else v
+
+
 def matching_device(db: Session, agent: BackupAgent) -> str | None:
-    """The Fenrir device this backup agent runs on: the one device in its tenant with the same host name."""
+    """The Fenrir device this backup agent runs on, within its tenant: the device with the same host name and, when
+    both agents report it, the same hardware serial number; or, when host names are ambiguous or differ, the one
+    device with that serial number."""
     name = (agent.hostname or "").split(".")[0].lower()
-    if not name:
-        return None
-    rows = [d for d in db.execute(select(Device).where(Device.tenant_id == agent.tenant_id)).scalars()
-            if (d.hostname or "").split(".")[0].lower() == name and d.api_key_hash != f"retired-{d.id}"]
-    return rows[0].id if len(rows) == 1 else None
+    serial = _serial((agent.inventory or {}).get("hardware_serial"))
+    devices = [d for d in db.execute(select(Device).where(Device.tenant_id == agent.tenant_id)).scalars()
+               if d.api_key_hash != f"retired-{d.id}"]
+    by_name = [d for d in devices if name and (d.hostname or "").split(".")[0].lower() == name]
+    if serial:
+        both = [d for d in by_name if _serial(d.serial_number) == serial]
+        if len(both) == 1:
+            return both[0].id
+        same = [d for d in devices if _serial(d.serial_number) == serial]
+        if len(same) == 1:
+            return same[0].id
+        # A device reporting another serial under this name is a different machine.
+        by_name = [d for d in by_name if not _serial(d.serial_number)]
+    return by_name[0].id if len(by_name) == 1 else None
 
 
 def link_devices(db: Session) -> int:

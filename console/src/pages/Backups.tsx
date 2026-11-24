@@ -1,8 +1,8 @@
 // Device backup: image backups of servers, PCs and Hyper-V hosts with the Fenrir backup agent (backup/ in this
 // repository). Repository passphrases and share passwords are sealed in this browser to each machine's key; the
 // server keeps only the sealed copies and can never open a backup.
-import { Fragment, useMemo, useState } from "react";
-import { api, ago, fmtTime, getToken } from "../api";
+import { Fragment, useEffect, useMemo, useState } from "react";
+import { api, ago, fmtTime, getToken, lockRepositories, rememberReauth as rememberReauthToken, onUnlockChange, rememberUnlock, unlockedUntil } from "../api";
 import { useApp } from "../app-context";
 import { newRecoveryKey, seal, sealSupported, type Sealed } from "../backup-seal";
 import { FileBrowser } from "./BackupFiles";
@@ -13,6 +13,8 @@ export interface BackupAgent {
   id: string; tenantId: string; deviceId: string | null; name: string; hostname: string; role: string;
   os: { family?: string; name?: string; version?: string; arch?: string }; agentVersion: string; online: boolean;
   lastSeenAt: string | null; publicKey: string; capabilities: string[]; vmCount: number; disks: string[];
+  diskInfo?: { path: string; size: number; model: string; serial: string; system: boolean; inUse: boolean }[];
+  firmware?: "uefi" | "bios" | null; secureBoot?: boolean | null;
   runningVms?: { sessionId: string; imageId: string; startedUnix: number; vncPort: number }[];
   lastBackup: { jobId: string; state: string; at: string; error: string | null } | null;
   runningJob: { id: string; label: string; state: string; progress: any } | null;
@@ -23,6 +25,7 @@ interface Repo {
   maintenanceAgentId: string | null; pruneEveryDays: number; lastPruneAt: string | null; anomalies: number;
   bootAgentId: string | null; bootEveryDays: number; lastVerifiedBoot: string | null; shareAuth: string; shareUser: string | null;
   isShare: boolean; agents: { id: string; name: string; viaGateway?: boolean }[];
+  s3?: S3Settings | null;
   gateway: { agentId: string; name: string; online: boolean; port: number; address: string | null; addresses: string[] } | null;
 }
 interface Job {
@@ -32,10 +35,12 @@ interface Job {
 interface Plan {
   id: string; name: string; agentId: string; agentName: string; repositoryId: string; job: any; label: string;
   schedule: any; retention: any; enabled: boolean; nextRunAt: string | null; lastRunAt: string | null;
+  copyToRepositoryId?: string | null;
 }
+type ImageApp = { writer: string; component: string; caption?: string; included: boolean; note?: string | null };
 interface Image {
   imageId: string; repositoryId: string; agentId: string | null; hostname: string; created: number; kind: string;
-  consistency: string; capturedBytes: number; storedNewBytes: number; disks: any[]; label: string | null; vmName: string | null;
+  consistency: string; applications?: ImageApp[]; capturedBytes: number; storedNewBytes: number; disks: any[]; label: string | null; vmName: string | null;
   anomaly: string | null; lastBootCheck: { outcome: string; at: string; message: string } | null;
 }
 
@@ -54,10 +59,18 @@ const unixTime = (t: number | null) => (t ? new Date(t * 1000).toLocaleString() 
 const isSharePath = (p: string) => /^(\\\\|\/\/|smb:\/\/)/i.test(p.trim());
 const StatePill = ({ state }: { state: string }) => <Pill value={state} tone={STATE_TONE[state] ?? "muted"} />;
 
+/** "reading 42% · 120 MB/s · 4 min left · 300 MB new" from the agent's progress (done/total, rate, ETA, stored). */
 function progressText(p: any): string {
   if (!p) return "";
-  const pct = p.bytes_total ? ` ${Math.floor((100 * (p.bytes_done || 0)) / p.bytes_total)}%` : "";
-  return `${p.phase || ""}${pct}`.trim();
+  const total = p.total ?? p.bytes_total, done = p.done ?? p.bytes_done ?? 0;
+  const parts = [`${p.phase || ""}${total ? ` ${Math.floor((100 * done) / total)}%` : ""}`.trim()];
+  if (p.rate) parts.push(`${bytes(p.rate)}/s`);
+  if (p.rate && p.eta_seconds != null) {
+    const s = p.eta_seconds;
+    parts.push(s < 60 ? "under a minute left" : s < 3600 ? `${Math.ceil(s / 60)} min left` : `${Math.floor(s / 3600)} h ${Math.ceil((s % 3600) / 60)} min left`);
+  }
+  if (p.stored) parts.push(`${bytes(p.stored)} new`);
+  return parts.filter(Boolean).join(" · ");
 }
 
 /** Poll a job until it finishes (connection tests, repository creation). */
@@ -140,7 +153,7 @@ function Machines({ agents, repos, reload }: { agents: BackupAgent[] | null; rep
         columns={[
           { key: "name", label: "Machine", render: (a) => <><b>{a.name}</b>{a.name !== a.hostname && <div className="small muted">{a.hostname}</div>}</> },
           { key: "tenant", label: "Customer", render: (a) => tenantName(a.tenantId) },
-          { key: "os", label: "System", render: (a) => <span className="small">{a.os.name || a.os.family} {a.os.version} · {a.role === "hyperv" ? `Hyper-V host (${a.vmCount} VMs)` : a.role}</span> },
+          { key: "os", label: "System", render: (a) => <span className="small">{a.os.name || a.os.family} {a.os.version} · {a.role === "hyperv" ? `Hyper-V host (${a.vmCount} VMs)` : a.role === "recovery" ? "recovery session (restores only)" : a.role}</span> },
           { key: "online", label: "Status", render: (a) => a.runningJob ? <Pill value={`${a.runningJob.label} ${progressText(a.runningJob.progress)}`} tone="blue" /> : <Pill value={a.online ? "online" : "offline"} tone={a.online ? "good" : "muted"} /> },
           { key: "last", label: "Last backup", render: (a) => a.lastBackup ? <><StatePill state={a.lastBackup.state} /> <span className="small muted">{ago(a.lastBackup.at)}</span></> : <span className="muted small">never</span> },
         ]} />
@@ -221,18 +234,34 @@ function AddMachines({ onClose }: { onClose: () => void }) {
             <label className="field">These machines are
               <select value={role} onChange={(e) => setRole(e.target.value)}>
                 <option value="server">Servers</option><option value="workstation">Desktops and laptops</option><option value="hyperv">Hyper-V hosts (back up their VMs)</option>
+                <option value="recovery">Recovery media (bare-metal restore)</option>
               </select>
             </label>
             <label className="field">Link valid for (days)<input type="number" min={1} max={90} value={days} onChange={(e) => setDays(Number(e.target.value))} /></label>
           </div>
           <p className="small">Machines installed with the Fenrir agent installer (Deploy agents) already have device backup: they appear here on their own. Use these links for machines that should only be backed up.</p>
           <p className="small muted">One link installs any number of machines until it expires. Each installs the backup agent as a protected system service (FenrirBackupAgent on Windows) that only administrators can stop or remove. It is separate from the Fenrir security agent and does not touch it.</p>
-          <button className="primary" disabled={busy || !tenant} onClick={create}>Create install links</button>
+          {role === "recovery" && <p className="small">Recovery media is a bootable USB stick or ISO for a machine that no longer starts, or new hardware. Started from it, the machine appears under Machines as a recovery session (restores only); restore a backup onto its disk from Images &amp; restore. Works with Secure Boot on.</p>}
+          <button className="primary" disabled={busy || !tenant} onClick={create}>{role === "recovery" ? "Create recovery media" : "Create install links"}</button>
         </>
       ) : (
         <>
           <p className="small">Expires {fmtTime(result.expiresAt)}. Treat these links like a password: anyone with one can add a machine to this customer.</p>
-          {Object.entries(result.links).map(([key, l]: [string, any]) => (
+          {result.recovery && (result.recovery.available ? (
+            <div className="card" style={{ marginBottom: 10 }}>
+              <div className="row" style={{ gap: 8 }}>
+                <a className="btn primary" href={result.recovery.iso} download>Download fenrir-recovery.iso{result.recovery.size ? ` (${bytes(result.recovery.size)})` : ""}</a>
+                <a className="btn" href={result.recovery.settings} download>Settings file only</a>
+              </div>
+              <ol className="small" style={{ marginTop: 8 }}>
+                <li>Write the ISO to a USB stick (balenaEtcher, Rufus in DD mode, or dd), or attach it to a VM as a DVD.</li>
+                <li>Start the machine from it (boot menu: usually F12, F11, F8 or Esc). Wired networks connect by themselves; Wi-Fi and fixed addresses are under Network settings on its screen.</li>
+                <li>It appears under Machines as a recovery session. In Images &amp; restore, restore a backup with it as the machine and its disk as the target.</li>
+              </ol>
+              <p className="small muted">The ISO carries this server's address and an enrolment code for recovery sessions until it expires. A session cannot read any backup until you give it access. With a stick from elsewhere, put the settings file in the root of any USB stick and choose "Look for server settings on a USB stick" on the recovery screen.</p>
+            </div>
+          ) : <div className="card warn-card">The recovery ISO is not on this server yet: place fenrir-recovery.iso from the Fenrir-Backup build in the backup agents folder under recovery/ (see docs/DEVICE_BACKUP.md).</div>)}
+          {Object.entries(result.links ?? {}).map(([key, l]: [string, any]) => (
             <div key={key} className="card" style={{ marginBottom: 10, opacity: l.available ? 1 : 0.6 }}>
               <div className="row" style={{ justifyContent: "space-between" }}><b>{l.name}</b>{!l.available && <Pill value="not built on this server yet" tone="warn" />}</div>
               {l.setup && <div className="row" style={{ gap: 8, marginTop: 6 }}><a className="btn primary" href={l.setup} download>Download {l.setupFile}</a><span className="small muted">Double-click and approve the administrator prompt.</span></div>}
@@ -240,7 +269,7 @@ function AddMachines({ onClose }: { onClose: () => void }) {
               <div className="row" style={{ gap: 6 }}><code className="mono" style={{ flex: 1, overflowX: "auto", whiteSpace: "nowrap" }}>{l.oneLiner}</code><button className="small" onClick={() => copy(l.oneLiner)}>Copy</button></div>
             </div>
           ))}
-          <p className="small muted">To uninstall later: {Object.entries(result.uninstall).map(([k, u]: [string, any]) => <Fragment key={k}><a href={u}>{k}</a>{" "}</Fragment>)}</p>
+          {result.uninstall && <p className="small muted">To uninstall later: {Object.entries(result.uninstall).map(([k, u]: [string, any]) => <Fragment key={k}><a href={u}>{k}</a>{" "}</Fragment>)}</p>}
         </>
       )}
     </Modal>
@@ -279,15 +308,50 @@ function SigninFields({ value, onChange }: { value: Signin; onChange: (s: Signin
   );
 }
 
-function TestConnection({ agent, path, signin }: { agent?: BackupAgent; path: string; signin: Signin | null }) {
+interface S3Settings { endpoint: string; region: string; path_style: boolean; lock_mode: "governance" | "compliance" | null; lock_days: number }
+interface S3Form { azure?: boolean; endpoint: string; region: string; bucket: string; prefix: string; pathStyle: boolean; lockMode: "none" | "governance" | "compliance"; lockDays: number; accessKey: string; secretKey: string }
+const emptyS3 = (): S3Form => ({ endpoint: "https://s3.eu-west-2.amazonaws.com", region: "eu-west-2", bucket: "", prefix: "fenrir", pathStyle: false, lockMode: "compliance", lockDays: 30, accessKey: "", secretKey: "" });
+const s3Path = (f: S3Form) => `${f.azure ? "azure" : "s3"}://${f.bucket.trim()}${f.prefix.trim() ? "/" + f.prefix.trim().replace(/^\/+|\/+$/g, "") : ""}`;
+const s3Settings = (f: S3Form): S3Settings => ({ endpoint: f.endpoint.trim().replace(/\/+$/, ""), region: f.region.trim() || "us-east-1", path_style: f.pathStyle, lock_mode: f.lockMode === "none" ? null : f.lockMode, lock_days: f.lockMode === "none" ? 0 : f.lockDays });
+const s3Signin = (f: S3Form): Signin => ({ mode: "password", domain: "", username: f.accessKey.trim(), password: f.secretKey });
+const s3Ok = (f: S3Form) => (f.azure ? /^https?:\/\/[^/\s]+(\/\S*)?$/ : /^https?:\/\/[^/\s]+$/).test(f.endpoint.trim().replace(/\/+$/, "")) && (f.azure ? /^[a-z0-9](?!.*--)[a-z0-9-]{1,61}[a-z0-9]$/ : /^[a-z0-9.-]{3,63}$/).test(f.bucket.trim()) && !!f.accessKey.trim() && !!f.secretKey && (f.lockMode === "none" || (f.lockDays > 7 && f.lockDays <= 36500));
+
+function S3Fields({ value: f, onChange }: { value: S3Form; onChange: (f: S3Form) => void }) {
+  const set = (p: Partial<S3Form>) => onChange({ ...f, ...p });
+  return (
+    <div className="form-grid">
+      <label className="field">Service<select value={f.azure ? "azure" : "s3"} onChange={(e) => set(e.target.value === "azure"
+        ? { azure: true, endpoint: `https://${f.accessKey.trim() || "<account>"}.blob.core.windows.net`, region: "", pathStyle: false }
+        : { azure: false, endpoint: "https://s3.eu-west-2.amazonaws.com", region: "eu-west-2" })}>
+        <option value="s3">Amazon S3 or S3-compatible (Wasabi, Backblaze B2, R2, MinIO)</option>
+        <option value="azure">Azure Blob Storage</option>
+      </select></label>
+      <label className="field">Endpoint<input value={f.endpoint} onChange={(e) => set({ endpoint: e.target.value })} placeholder={f.azure ? "https://account.blob.core.windows.net" : "https://s3.eu-west-2.amazonaws.com"} /></label>
+      {!f.azure && <label className="field">Region<input value={f.region} onChange={(e) => set({ region: e.target.value })} placeholder="eu-west-2 (us-east-1 for most others)" /></label>}
+      <label className="field">{f.azure ? "Container (with version-level immutability for locked backups)" : "Bucket (created with Object Lock enabled)"}<input value={f.bucket} onChange={(e) => set({ bucket: e.target.value.toLowerCase() })} /></label>
+      <label className="field">Folder in the {f.azure ? "container" : "bucket"}<input value={f.prefix} onChange={(e) => set({ prefix: e.target.value })} /></label>
+      <label className="field">{f.azure ? "Storage account name" : "Access key ID"}<input value={f.accessKey} onChange={(e) => set(f.azure ? { accessKey: e.target.value, endpoint: `https://${e.target.value.trim() || "<account>"}.blob.core.windows.net` } : { accessKey: e.target.value })} autoComplete="off" /></label>
+      <label className="field">{f.azure ? "Account key or SAS token" : "Secret access key"}<input type="password" value={f.secretKey} onChange={(e) => set({ secretKey: e.target.value })} autoComplete="new-password" /></label>
+      <label className="field">Immutable backups ({f.azure ? "immutability policy" : "Object Lock"})<select value={f.lockMode} onChange={(e) => set({ lockMode: e.target.value as S3Form["lockMode"] })}>
+        <option value="compliance">Compliance: nobody can delete a backup early</option>
+        <option value="governance">Governance: only special admin rights can</option>
+        <option value="none">Off</option>
+      </select></label>
+      {f.lockMode !== "none" && <label className="field">Keep each backup locked for (days, more than 7)<input type="number" min={8} max={36500} value={f.lockDays} onChange={(e) => set({ lockDays: Number(e.target.value) })} /></label>}
+      {!f.azure && <label className="row small" style={{ gap: 6 }}><input type="checkbox" checked={f.pathStyle} onChange={(e) => set({ pathStyle: e.target.checked })} /> Path-style addresses (MinIO and most self-hosted storage)</label>}
+    </div>
+  );
+}
+
+function TestConnection({ agent, path, signin, s3 }: { agent?: BackupAgent; path: string; signin: Signin | null; s3?: S3Settings | null }) {
   const [state, setState] = useState<{ busy?: boolean; job?: Job | null; err?: string; key?: string }>({});
-  const key = JSON.stringify([agent?.id, path.trim(), signin]);
+  const key = JSON.stringify([agent?.id, path.trim(), signin, s3]);
   const go = async () => {
     if (!agent) return;
     setState({ busy: true, key });
     try {
       const sealedShare = signin && signin.mode === "password" ? await sealSignin(agent, signin) : null;
-      const { id } = await api<{ id: string }>(`backup/agents/${agent.id}/check-access`, { body: { path, sealedShare } });
+      const { id } = await api<{ id: string }>(`backup/agents/${agent.id}/check-access`, { body: { path, sealedShare, s3: s3 ?? null } });
       const job = await waitForJob(id);
       setState(job ? { job, key } : { err: `${agent.name} did not answer in time. Is it online?`, key });
     } catch (e) { setState({ err: (e as Error).message, key }); }
@@ -303,7 +367,7 @@ function TestConnection({ agent, path, signin }: { agent?: BackupAgent; path: st
       {cur.job?.state === "failed" && <div className="small" style={{ color: "#fca5a5" }}>{cur.job.error}</div>}
       {cur.job && r && cur.job.state !== "failed" && (
         <div className="small" style={{ color: "#86efac" }}>
-          {r.share ? "Signed in to the share and wrote a test file." : "Wrote a test file."} {r.repository ? "A repository is already there." : r.exists ? "The folder exists." : "The folder will be created."}
+          {r.s3 ? `Object storage: ${r.note}.` : <>{r.share ? "Signed in to the share and wrote a test file." : "Wrote a test file."} {r.repository ? "A repository is already there." : r.exists ? "The folder exists." : "The folder will be created."}</>}
           {r.free_bytes != null && ` Free: ${bytes(r.free_bytes)} of ${bytes(r.total_bytes)}.`}
           {cur.job.warnings.map((w, i) => <div key={i}>{w}</div>)}
         </div>
@@ -340,6 +404,7 @@ function Repositories({ repos, agents, reload }: { repos: Repo[] | null; agents:
             <div className="small" style={{ marginTop: 6 }}>
               {r.images} images · {bytes(r.storedBytes)} stored · last {unixTime(r.lastImage)} · machines: {r.agents.map((a) => a.name).join(", ") || "none"}
               {r.isShare && <> · share sign-in: {r.shareAuth === "password" ? r.shareUser : r.shareAuth === "machine" ? "computer account" : "none"}</>}
+              {r.s3 && <> · object storage, key {r.shareUser} · {r.s3.lock_mode ? `Object Lock ${r.s3.lock_mode}, ${r.s3.lock_days} days` : "no Object Lock"}</>}
             </div>
             {r.gateway && (
               <div className="small" style={{ marginTop: 4 }}>
@@ -351,7 +416,7 @@ function Repositories({ repos, agents, reload }: { repos: Repo[] | null; agents:
             <div className="small muted">Reclaim space every {r.pruneEveryDays || "—"} days on {name(r.maintenanceAgentId)} (last {fmtTime(r.lastPruneAt) || "never"}) · boot verification {r.bootEveryDays ? `every ${r.bootEveryDays} days on ${name(r.bootAgentId)}, last verified ${fmtTime(r.lastVerifiedBoot) || "never"}` : "off"}</div>
             <div className="row" style={{ gap: 6, marginTop: 8, flexWrap: "wrap" }}>
               {can("configure") && <button className="small" onClick={() => setGrant(r)}>Give a machine access</button>}
-              {can("configure") && r.isShare && <button className="small" onClick={() => setShare(r)}>Change share sign-in</button>}
+              {can("configure") && (r.isShare || r.s3) && <button className="small" onClick={() => setShare(r)}>{r.s3 ? "Change access keys" : "Change share sign-in"}</button>}
               {can("configure") && <button className="small" onClick={() => setGateway(r)}>{r.gateway ? "Gateway settings" : "Serve through a gateway"}</button>}
               {!r.hold && can("respond") && <button className="small" disabled={busy} onClick={async () => { const why = await promptDialog("Reason for the hold (legal hold, investigation…)", ""); if (why !== null) act(() => api(`backup/repositories/${r.id}/hold`, { body: { hold: true, reason: why } }), "Hold placed"); }}>Place on hold</button>}
               {r.hold && can("destructive") && <button className="small danger" disabled={busy} onClick={async () => { if (await confirmDialog("Release the hold? Retention will delete old images again. Make sure the machine is clean first.")) act(() => api(`backup/repositories/${r.id}/hold`, { body: { hold: false } }), "Hold released"); }}>Release hold</button>}
@@ -392,12 +457,18 @@ function CreateRepo({ agents, onClose }: { agents: BackupAgent[]; onClose: () =>
   const [members, setMembers] = useState<string[]>([]);
   const [creator, setCreator] = useState("");
   const [signin, setSignin] = useState<Signin>(noSignin());
+  const [kind, setKind] = useState<"folder" | "s3">("folder");
+  const [s3, setS3] = useState<S3Form>(emptyS3());
   const [saved, setSaved] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
+  // A repository that already exists (moved from a Fenrir-Backup server): listed, not created; its passphrase.
+  const [existing, setExisting] = useState(false);
+  const isS3 = kind === "s3";
   const tenant = agents.find((a) => a.id === (creator || members[0]))?.tenantId;
   const pool = agents.filter((a) => !tenant || a.tenantId === tenant);
-  const share = isSharePath(path);
-  const ok = name.trim() && path.trim() && pass.length >= 12 && pass === pass2 && members.length > 0 && members.includes(creator) && (!share || signinOk(signin));
+  const share = !isS3 && isSharePath(path);
+  const location = isS3 ? s3Path(s3) : path;
+  const ok = name.trim() && (isS3 ? s3Ok(s3) : path.trim()) && (existing ? pass.length > 0 : pass.length >= 12) && pass === pass2 && members.length > 0 && members.includes(creator) && (!share || signinOk(signin));
   const download = () => {
     const blob = new Blob([recovery.fileContents], { type: "application/json" });
     const a = document.createElement("a");
@@ -409,15 +480,17 @@ function CreateRepo({ agents, onClose }: { agents: BackupAgent[]; onClose: () =>
     const res = await run(async () => {
       const access = await Promise.all(members.map(async (id) => {
         const a = agents.find((x) => x.id === id)!;
-        const secret = JSON.stringify({ passphrase: pass, recovery_key: id === creator ? recovery.fileContents : null });
-        return { agentId: id, sealed: await seal(a.publicKey, secret), sealedShare: share && signin.mode === "password" ? await sealSignin(a, signin) : null };
+        const secret = JSON.stringify({ passphrase: pass, recovery_key: id === creator && !existing ? recovery.fileContents : null });
+        return { agentId: id, sealed: await seal(a.publicKey, secret), sealedShare: isS3 ? await sealSignin(a, s3Signin(s3)) : share && signin.mode === "password" ? await sealSignin(a, signin) : null };
       }));
       return api<{ id: string; initJobId: string }>("backup/repositories", { body: {
-        name, path, repoUuid: recovery.repoId, initAgentId: creator, access,
-        share_auth: share ? signin.mode : "none", share_user: share && signin.mode === "password" ? signinUser(signin) : null } });
+        name, path: location, ...(existing ? { existing: true } : { repoUuid: recovery.repoId }), initAgentId: creator, access,
+        share_auth: isS3 ? "password" : share ? signin.mode : "none",
+        share_user: isS3 ? s3.accessKey.trim() : share && signin.mode === "password" ? signinUser(signin) : null,
+        s3: isS3 ? s3Settings(s3) : null } });
     });
     if (!res) return;
-    setStatus("Creating the repository on the machine…");
+    setStatus(existing ? "The machine is opening the repository and listing its backups…" : "Creating the repository on the machine…");
     const job = await waitForJob(res.initJobId);
     setStatus(job ? (job.state === "failed" ? `Failed: ${job.error}` : "Ready.") : "Still waiting for the machine: check Activity.");
   };
@@ -427,7 +500,9 @@ function CreateRepo({ agents, onClose }: { agents: BackupAgent[]; onClose: () =>
         <>
           <div className="form-grid">
             <label className="field">Name<input value={name} onChange={(e) => setName(e.target.value)} placeholder="Office NAS" /></label>
-            <label className="field">Folder (on the machines)<input value={path} onChange={(e) => setPath(e.target.value)} placeholder={"\\\\nas\\backups\\fenrir or /mnt/backup"} /></label>
+            <label className="row small" style={{ gap: 6 }}><input type="checkbox" checked={existing} onChange={(e) => setExisting(e.target.checked)} /> It already exists (moved from a Fenrir-Backup server, or added again): its backups are listed, nothing is created. Enter its passphrase.</label>
+            <label className="field">Stored on<select value={kind} onChange={(e) => setKind(e.target.value as "folder" | "s3")}><option value="folder">A folder or network share</option><option value="s3">S3 object storage (AWS, Wasabi, B2, R2, MinIO…)</option></select></label>
+            {!isS3 && <label className="field">Folder (on the machines)<input value={path} onChange={(e) => setPath(e.target.value)} placeholder={"\\\\nas\\backups\\fenrir or /mnt/backup"} /></label>}
             <label className="field">Passphrase (12+ characters)<input type="password" value={pass} onChange={(e) => setPass(e.target.value)} autoComplete="new-password" /></label>
             <label className="field">Confirm passphrase<input type="password" value={pass2} onChange={(e) => setPass2(e.target.value)} autoComplete="new-password" /></label>
           </div>
@@ -436,13 +511,18 @@ function CreateRepo({ agents, onClose }: { agents: BackupAgent[]; onClose: () =>
             <label key={a.id} className="row small" style={{ gap: 6 }}>
               <input type="checkbox" checked={members.includes(a.id)} onChange={(e) => { const m = e.target.checked ? [...members, a.id] : members.filter((x) => x !== a.id); setMembers(m); if (!m.includes(creator)) setCreator(m[0] ?? ""); }} />
               {a.name} {!a.online && <span className="muted">(offline)</span>}
-              {members.includes(a.id) && <label className="small muted" style={{ marginLeft: 8 }}><input type="radio" checked={creator === a.id} onChange={() => setCreator(a.id)} /> creates it</label>}
+              {members.includes(a.id) && <label className="small muted" style={{ marginLeft: 8 }}><input type="radio" checked={creator === a.id} onChange={() => setCreator(a.id)} /> {existing ? "opens it" : "creates it"}</label>}
             </label>
           ))}
+          {isS3 && <><h3 style={{ marginTop: 12 }}>Object storage</h3><S3Fields value={s3} onChange={setS3} />
+            {s3.lockMode === "compliance" && <p className="small">Every backup stays undeletable for at least {s3.lockDays} days: not by ransomware with these keys, not by the storage account owner, not by Fenrir. Old backups go only after their lock ends; maintenance renews the locks of backups still in use.</p>}</>}
           {share && <><h3 style={{ marginTop: 12 }}>Network share sign-in</h3><SigninFields value={signin} onChange={setSignin} /></>}
-          <TestConnection agent={agents.find((a) => a.id === creator)} path={path} signin={share ? signin : null} />
+          {isS3 ? (s3Ok(s3) && <TestConnection agent={agents.find((a) => a.id === creator)} path={location} signin={s3Signin(s3)} s3={s3Settings(s3)} />)
+            : <TestConnection agent={agents.find((a) => a.id === creator)} path={path} signin={share ? signin : null} />}
           <p className="small muted">The passphrase is encrypted in this browser for each chosen machine. This server stores only the encrypted copies and can never open the backups.</p>
-          <button className="primary" disabled={!ok} onClick={() => setStep(1)}>Next: recovery key</button>
+          {existing
+            ? <><button className="primary" disabled={!ok || busy || !!status} onClick={create}>Add repository</button>{status && <p role="status">{status}</p>}</>
+            : <button className="primary" disabled={!ok} onClick={() => setStep(1)}>Next: recovery key</button>}
         </>
       )}
       {step === 1 && (
@@ -538,12 +618,17 @@ function ShareSignin({ repo, agents, onClose }: { repo: Repo; agents: BackupAgen
     await api(`backup/repositories/${repo.id}/share`, { body: { share_auth: s.mode, share_user: s.mode === "password" ? signinUser(s) : null, access } });
   }, "Share sign-in updated").then(onClose);
   return (
-    <Modal wide title={`Network sign-in for ${repo.name}`} onClose={onClose}
+    <Modal wide title={repo.s3 ? `Access keys for ${repo.name}` : `Network sign-in for ${repo.name}`} onClose={onClose}
       footer={<button className="primary" disabled={busy || !signinOk(s)} onClick={save}>Save for {machines.length} machine{machines.length === 1 ? "" : "s"}</button>}>
       <div className="mono small" style={{ marginBottom: 8 }}>{repo.path}</div>
-      <SigninFields value={s} onChange={setS} />
-      <TestConnection agent={machines.find((m) => m.online) ?? machines[0]} path={repo.path} signin={s} />
-      <p className="small muted">Changing the password here does not change it on the NAS or server; change it there first, then here.</p>
+      {repo.s3 ? (
+        <div className="form-grid">
+          <label className="field">Access key ID<input value={s.username} onChange={(e) => setS({ ...s, mode: "password", domain: "", username: e.target.value })} autoComplete="off" /></label>
+          <label className="field">Secret access key<input type="password" value={s.password} onChange={(e) => setS({ ...s, mode: "password", password: e.target.value })} autoComplete="new-password" /></label>
+        </div>
+      ) : <SigninFields value={s} onChange={setS} />}
+      <TestConnection agent={machines.find((m) => m.online) ?? machines[0]} path={repo.path} signin={s} s3={repo.s3} />
+      <p className="small muted">{repo.s3 ? "Create the new keys at the storage provider first, then enter them here; remove the old ones afterwards." : "Changing the password here does not change it on the NAS or server; change it there first, then here."}</p>
     </Modal>
   );
 }
@@ -551,7 +636,7 @@ function ShareSignin({ repo, agents, onClose }: { repo: Repo; agents: BackupAgen
 // ---------------------------------------------------------------- plans
 
 function describeSchedule(s: any): string {
-  if (s.type === "interval") return `every ${s.hours} h`;
+  if (s.type === "interval") return s.minutes ? (s.hours ? `every ${s.hours} h ${s.minutes} min` : `every ${s.minutes} min`) : `every ${s.hours} h`;
   if (s.type === "daily") return `${s.days?.length ? s.days.map((d: number) => DAYS[d]).join(", ") : "daily"} at ${s.time}`;
   return "manual";
 }
@@ -564,7 +649,24 @@ function Plans({ agents, repos }: { agents: BackupAgent[]; repos: Repo[] }) {
   const repoName = (id: string) => repos.find((r) => r.id === id)?.name ?? "—";
   return (
     <div className="card">
-      {can("configure") && <button className="primary" style={{ marginBottom: 10 }} onClick={() => setEdit("new")}>New plan</button>}
+      {can("configure") && <div className="row" style={{ gap: 8, marginBottom: 10 }}>
+        <button className="primary" onClick={() => setEdit("new")}>New plan</button>
+        <label className="button small" title="The export from a Fenrir-Backup server's Settings › Move to Fenrir Cloud. Add its repositories here as existing first.">
+          Import plans from Fenrir-Backup
+          <input type="file" accept="application/json,.json" style={{ display: "none" }} onChange={async (e) => {
+            const f = e.target.files?.[0];
+            e.target.value = "";
+            if (!f) return;
+            let ex: unknown;
+            try { ex = JSON.parse(await f.text()); } catch { ex = null; }
+            const r = await run(() => api<{ created: string[]; skipped: { name: string; reason: string }[] }>("backup/import", { body: { export: ex, tenantId: tenantId || undefined } }));
+            if (!r) return;
+            plans.reload?.();
+            const skipped = r.skipped.map((s) => `${s.name}: ${s.reason}`).join("\n");
+            await confirmDialog(`${r.created.length} plan(s) created${r.created.length ? `: ${r.created.join(", ")}` : ""}.${skipped ? `\n\nSkipped:\n${skipped}` : ""}`);
+          }} />
+        </label>
+      </div>}
       <Table rows={plans.data} onRow={can("configure") ? setEdit : undefined} empty="No plans. A plan backs up one machine into one repository on a schedule."
         columns={[
           { key: "name", label: "Plan", render: (p) => <><b>{p.name}</b><div className="small muted">{p.label} of {p.agentName}</div></> },
@@ -590,12 +692,13 @@ function PlanEditor({ plan, agents, repos, onClose }: { plan: Plan | null; agent
   const [schedule, setSchedule] = useState<any>(plan?.schedule ?? { type: "daily", time: "01:00", days: [], utc_offset_minutes: -new Date().getTimezoneOffset() });
   const [retention, setRetention] = useState<any>(plan?.retention ?? { keep_last: 7, keep_daily: 14, keep_weekly: 8, keep_monthly: 12, keep_yearly: 0 });
   const [enabled, setEnabled] = useState(plan?.enabled ?? true);
+  const [copyTo, setCopyTo] = useState(plan?.copyToRepositoryId ?? "");
   const caps = agent?.capabilities ?? [];
   const jobKind = job ?? (caps.includes("backup_hyperv") ? { type: "backup_hyperv", vm_ids: [] } : caps.includes("backup_system") ? { type: "backup_system" } : { type: "backup_disks", paths: [] });
   const repo = repoId || usable[0]?.id || "";
   const save = () => run(() => plan
-    ? api(`backup/plans/${plan.id}`, { method: "PATCH", body: { name, job: jobKind, schedule, retention, enabled } })
-    : api("backup/plans", { body: { name, agentId, repositoryId: repo, job: jobKind, schedule, retention, enabled } }), "Plan saved").then((r) => r !== undefined && onClose());
+    ? api(`backup/plans/${plan.id}`, { method: "PATCH", body: { name, job: jobKind, schedule, retention, enabled, copyToRepositoryId: copyTo || null } })
+    : api("backup/plans", { body: { name, agentId, repositoryId: repo, job: jobKind, schedule, retention, enabled, copyToRepositoryId: copyTo || null } }), "Plan saved").then((r) => r !== undefined && onClose());
   const remove = async () => { if (plan && await confirmDialog(`Delete the plan ${plan.name}? Its backups are kept.`)) run(() => api(`backup/plans/${plan.id}`, { method: "DELETE" }), "Plan deleted").then(onClose); };
   return (
     <Modal wide title={plan ? `Edit ${plan.name}` : "New backup plan"} onClose={onClose}
@@ -619,8 +722,11 @@ function PlanEditor({ plan, agents, repos, onClose }: { plan: Plan | null; agent
       <h3 style={{ marginTop: 12 }}>When</h3>
       <div className="form-grid">
         <label className="field">Schedule<select value={schedule.type} onChange={(e) => setSchedule(e.target.value === "interval" ? { type: "interval", hours: 4 } : e.target.value === "daily" ? { type: "daily", time: "01:00", days: [], utc_offset_minutes: -new Date().getTimezoneOffset() } : { type: "manual" })}>
-          <option value="daily">At a time of day</option><option value="interval">Every few hours</option><option value="manual">Only when started</option></select></label>
-        {schedule.type === "interval" && <label className="field">Every (hours)<input type="number" min={1} max={744} value={schedule.hours} onChange={(e) => setSchedule({ ...schedule, hours: Number(e.target.value) })} /></label>}
+          <option value="daily">At a time of day</option><option value="interval">Every few minutes or hours</option><option value="manual">Only when started</option></select></label>
+        {schedule.type === "interval" && <label className="field">Every<span className="row" style={{ gap: 6 }}>
+          <input type="number" min={0} max={744} value={schedule.hours ?? 0} onChange={(e) => setSchedule({ ...schedule, hours: Math.max(0, Number(e.target.value)) })} style={{ width: 80 }} /> h
+          <input type="number" min={0} max={59} value={schedule.minutes ?? 0} onChange={(e) => setSchedule({ ...schedule, minutes: Math.min(59, Math.max(0, Number(e.target.value))) })} style={{ width: 80 }} /> min
+        </span><span className="small muted">At least 5 minutes. A run starts after the previous one finishes; each reads the used disk space again and stores only changes.</span></label>}
         {schedule.type === "daily" && <label className="field">Time (this browser's time zone)<input type="time" value={schedule.time} onChange={(e) => setSchedule({ ...schedule, time: e.target.value })} /></label>}
       </div>
       {schedule.type === "daily" && <div className="row small" style={{ gap: 8, marginTop: 6 }}>{DAYS.map((d, i) => (
@@ -628,11 +734,19 @@ function PlanEditor({ plan, agents, repos, onClose }: { plan: Plan | null; agent
       ))}<span className="muted">(none ticked = every day)</span></div>}
       <h3 style={{ marginTop: 12 }}>Keep</h3>
       <div className="form-grid">
-        {["keep_last", "keep_daily", "keep_weekly", "keep_monthly", "keep_yearly"].map((k) => (
+        {["keep_last", "keep_hourly", "keep_daily", "keep_weekly", "keep_monthly", "keep_yearly"].map((k) => (
           <label key={k} className="field">{k.replace("keep_", "").replace(/^./, (c) => c.toUpperCase())}<input type="number" min={0} value={retention?.[k] ?? 0} onChange={(e) => setRetention({ ...(retention ?? {}), [k]: Number(e.target.value) })} /></label>
         ))}
       </div>
       <p className="small muted">All zero keeps everything. Old images are only deleted after a successful backup, and never while the repository is on hold.</p>
+      {usable.some((r) => r.id !== repo) && <>
+        <h3 style={{ marginTop: 12 }}>Off-site copy</h3>
+        <label className="field">After each backup, also copy it to<select value={copyTo} onChange={(e) => setCopyTo(e.target.value)}>
+          <option value="">No copy</option>
+          {usable.filter((r) => r.id !== repo).map((r) => <option key={r.id} value={r.id}>{r.name}</option>)}
+        </select></label>
+        <p className="small muted">The machine copies each new image to the second repository, encrypted for it and verified there (for example a NAS backup copied to S3 or Azure). It needs access to both.</p>
+      </>}
       <label className="row small" style={{ gap: 6 }}><input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} /> Enabled</label>
     </Modal>
   );
@@ -644,25 +758,89 @@ function agentInventoryDisks(agent?: BackupAgent): string[] {
 
 // ---------------------------------------------------------------- images, restore, boot checks
 
+interface ImageDevice {
+  key: string; name: string; hostname: string; vmName: string | null; agentId: string | null; tenantId: string;
+  images: number; lastCreated: number; firstCreated: number; storedBytes: number; lastKind: string; lastConsistency: string;
+  anomalies: number; lastVerified: string | null; repositories: { id: string; name: string; images: number; unlocked: boolean }[];
+}
+
+/** Re-render when a repository is unlocked or locked, and when an unlock runs out. */
+function useUnlocks(): number {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    const off = onUnlockChange(() => setN((x) => x + 1));
+    const t = window.setInterval(() => setN((x) => x + 1), 30_000);
+    return () => { off(); window.clearInterval(t); };
+  }, []);
+  return n;
+}
+
+// Backed-up machines first; a machine's backups open only once its repository is unlocked in this browser session:
+// the passphrase is tried on a machine with access (sealed to it here, never seen by the server), after a fresh
+// password (and MFA) check. The unlock lasts 30 minutes.
 function Images({ agents, repos }: { agents: BackupAgent[]; repos: Repo[] }) {
   const { tenantId } = useApp();
-  const [repo, setRepo] = useState("");
-  const images = useListData<Image>("backup/images", { tenantId: tenantId || undefined, repositoryId: repo || undefined }, [tenantId, repo]);
+  const tick = useUnlocks();
+  const devices = useListData<ImageDevice>("backup/image-devices", { tenantId: tenantId || undefined }, [tenantId, tick]);
+  const [open, setOpen] = useState<ImageDevice | null>(null);
+  const [asking, setAsking] = useState<ImageDevice | null>(null);
+  const [filter, setFilter] = useState("");
+  const isOpen = (d: ImageDevice) => d.repositories.some((r) => unlockedUntil(r.id));
+  const pick = (d: ImageDevice) => (isOpen(d) ? setOpen(d) : setAsking(d));
+  if (open) {
+    const current = devices.data?.find((d) => d.key === open.key) ?? open;
+    return <DeviceImages device={current} agents={agents} repos={repos} onBack={() => setOpen(null)} onUnlock={() => setAsking(current)} />;
+  }
+  const rows = (devices.data ?? null)?.filter((d) => !filter || `${d.name} ${d.hostname}`.toLowerCase().includes(filter.toLowerCase())) ?? null;
+  return (
+    <div className="card">
+      <div className="row" style={{ marginBottom: 10, gap: 8 }}>
+        <input placeholder="Find a machine" value={filter} onChange={(e) => setFilter(e.target.value)} style={{ maxWidth: 260 }} />
+        <span className="small muted">Choose a machine to see its backups. You will be asked for the repository passphrase and to confirm it's you.</span>
+        {devices.data?.some(isOpen) && <button className="small" style={{ marginLeft: "auto" }} onClick={() => lockRepositories()}>Lock all</button>}
+      </div>
+      <Table rows={rows} empty="No backups yet." onRow={pick}
+        columns={[
+          { key: "name", label: "Machine", render: (d) => <><b>{d.name}</b>{d.vmName && <span className="small muted"> · VM on {d.hostname}</span>}{d.anomalies > 0 && <div className="small" style={{ color: "#fca5a5" }}>⚠ {d.anomalies} backup{d.anomalies === 1 ? "" : "s"} flagged</div>}</> },
+          { key: "images", label: "Backups", render: (d) => <span>{d.images} <span className="small muted">since {new Date(d.firstCreated * 1000).toLocaleDateString()}</span></span> },
+          { key: "last", label: "Latest", render: (d) => <span>{unixTime(d.lastCreated)} <span className="small muted">{d.lastKind} · {d.lastConsistency}</span></span> },
+          { key: "stored", label: "Stored", render: (d) => <span className="small">{bytes(d.storedBytes)}</span> },
+          { key: "boot", label: "Last verified boot", render: (d) => d.lastVerified ? <Pill value={ago(d.lastVerified)} tone="good" /> : <span className="small muted">not tested</span> },
+          { key: "repo", label: "Repository", render: (d) => <span className="small">{d.repositories.map((r) => r.name).join(", ")}</span> },
+          { key: "lock", label: "", render: (d) => isOpen(d) ? <Pill value="Unlocked" tone="good" /> : <span className="small muted">🔒 Locked</span> },
+        ]} />
+      {asking && <UnlockDialog device={asking} agents={agents} repos={repos} onClose={(ok) => { const d = asking; setAsking(null); if (ok) setOpen(d); }} />}
+    </div>
+  );
+}
+
+function DeviceImages({ device, agents, repos, onBack, onUnlock }: {
+  device: ImageDevice; agents: BackupAgent[]; repos: Repo[]; onBack: () => void; onUnlock: () => void;
+}) {
+  const tick = useUnlocks();
+  const images = useListData<Image>("backup/images", { device: device.key }, [device.key, tick]);
   const [restore, setRestore] = useState<Image | null>(null);
   const [boot, setBoot] = useState<Image | null>(null);
   const [files, setFiles] = useState<Image | null>(null);
   const { can } = useApp();
+  const locked = device.repositories.filter((r) => !unlockedUntil(r.id));
+  const until = Math.max(...device.repositories.map((r) => unlockedUntil(r.id) ?? 0));
+  useEffect(() => { if (locked.length === device.repositories.length) onBack(); }, [tick]);  // ran out, or locked
   return (
     <div className="card">
-      <div className="row" style={{ marginBottom: 10 }}>
-        <select value={repo} onChange={(e) => setRepo(e.target.value)}><option value="">All repositories</option>{repos.map((r) => <option key={r.id} value={r.id}>{r.name}</option>)}</select>
+      <div className="row" style={{ marginBottom: 10, gap: 8 }}>
+        <button className="small" onClick={onBack}>← All machines</button>
+        <h3 style={{ margin: 0 }}>{device.name}{device.vmName && <span className="small muted"> · VM on {device.hostname}</span>}</h3>
+        <span className="small muted">Unlocked until {new Date(until).toLocaleTimeString()}</span>
+        <button className="small" style={{ marginLeft: "auto" }} onClick={() => { lockRepositories(device.repositories.map((r) => r.id)); onBack(); }}>Lock</button>
       </div>
-      <Table rows={images.data} empty="No images yet."
+      {locked.length > 0 && <p className="small">{locked.map((r) => `${r.images} backup${r.images === 1 ? "" : "s"} in ${r.name}`).join(", ")} still locked. <button className="small" onClick={onUnlock}>Unlock</button></p>}
+      <Table rows={images.data} empty="No backups."
         columns={[
-          { key: "what", label: "Image", render: (i) => <><b>{i.vmName ?? i.hostname}</b> <span className="small muted">{i.kind}{i.label ? ` · ${i.label}` : ""}</span>{i.anomaly && <div className="small" style={{ color: "#fca5a5" }}>⚠ {i.anomaly}</div>}</> },
+          { key: "what", label: "Backup", render: (i) => <><span>{i.kind}</span>{i.label && <span className="small muted"> · {i.label}</span>}{device.repositories.length > 1 && <div className="small muted">{repos.find((r) => r.id === i.repositoryId)?.name}</div>}{i.anomaly && <div className="small" style={{ color: "#fca5a5" }}>⚠ {i.anomaly}</div>}</> },
           { key: "created", label: "Taken", render: (i) => unixTime(i.created) },
           { key: "size", label: "Size", render: (i) => <span className="small">{bytes(i.capturedBytes)} · {bytes(i.storedNewBytes)} new</span> },
-          { key: "consistency", label: "Consistency" },
+          { key: "consistency", label: "Consistency", render: (i) => <><span>{i.consistency}</span><AppsLine apps={i.applications} /></> },
           { key: "boot", label: "Boots?", render: (i) => i.lastBootCheck ? <Pill value={i.lastBootCheck.outcome} tone={i.lastBootCheck.outcome === "failed" ? "bad" : "good"} /> : <span className="small muted">not tested</span> },
           { key: "act", label: "", render: (i) => <div className="row" style={{ gap: 4 }}>
             {can("scripts") && <button className="small primary" onClick={() => setFiles(i)}>Browse files</button>}
@@ -675,6 +853,93 @@ function Images({ agents, repos }: { agents: BackupAgent[]; repos: Repo[] }) {
       {files && <FileBrowser image={files} onClose={() => setFiles(null)} />}
     </div>
   );
+}
+
+/** Repository passphrase + password (+ MFA code): the passphrase is checked by a machine with access. */
+function UnlockDialog({ device, agents, repos, onClose }: { device: ImageDevice; agents: BackupAgent[]; repos: Repo[]; onClose: (ok: boolean) => void }) {
+  const { me } = useApp();
+  const lockedRepos = device.repositories.filter((r) => !unlockedUntil(r.id));
+  const [repoId, setRepoId] = useState(lockedRepos[0]?.id ?? device.repositories[0]?.id ?? "");
+  const repo = repos.find((r) => r.id === repoId);
+  // Who checks the passphrase: a machine with access, online, the backed-up machine itself first.
+  const checkers = agents.filter((a) => repo?.agents.some((x) => x.id === a.id))
+    .sort((a, b) => Number(b.online) - Number(a.online) || Number(b.id === device.agentId) - Number(a.id === device.agentId));
+  const [agentId, setAgentId] = useState("");
+  const checker = checkers.find((a) => a.id === agentId) ?? checkers.find((a) => a.online);
+  const [pass, setPass] = useState("");
+  const [password, setPassword] = useState("");
+  const [code, setCode] = useState("");
+  const [needCode, setNeedCode] = useState(!!me?.user?.mfaEnabled);
+  const [state, setState] = useState<{ busy?: string; err?: string }>({});
+  const go = async () => {
+    if (!checker) return;
+    setState({ busy: "Confirming it's you…" });
+    try {
+      try {
+        const r = await api<{ reauthToken: string; expiresInSeconds: number }>("auth/reauth", { body: { password, ...(code ? { code } : {}) } });
+        rememberReauthToken(r.reauthToken, r.expiresInSeconds);
+      } catch (e) {
+        if ((e as Error).message === "MFA code required") { setNeedCode(true); setState({ err: "Enter the code from your authenticator app." }); return; }
+        throw e;
+      }
+      setState({ busy: `Checking the passphrase on ${checker.name}…` });
+      const sealed = await seal(checker.publicKey, JSON.stringify({ passphrase: pass, recovery_key: null }));
+      const { id } = await api<{ id: string }>(`backup/repositories/${repoId}/unlock`, { body: { agentId: checker.id, sealed } });
+      const until = Date.now() + 3 * 60_000;
+      while (Date.now() < until) {
+        await new Promise((r) => setTimeout(r, 1500));
+        const r = await api<{ state: string; error?: string; token?: string; expiresInSeconds?: number }>(`backup/unlock/${id}`);
+        if (r.state === "unlocked") {
+          rememberUnlock(repoId, r.token!, r.expiresInSeconds!);
+          setPass(""); setPassword(""); setCode("");
+          onClose(true);
+          return;
+        }
+        if (r.state === "failed") throw new Error(/passphrase/i.test(r.error ?? "") ? "That passphrase does not open this repository." : r.error || "The check failed.");
+      }
+      throw new Error(`${checker.name} did not answer in time. Is it busy with another job (see Activity)?`);
+    } catch (e) {
+      setState({ err: (e as Error).message });
+    }
+  };
+  const ok = !!checker && !!pass && !!password && (!needCode || code.length === 6) && !state.busy;
+  return (
+    <Modal title={`Open the backups of ${device.name}`} onClose={() => onClose(false)}
+      footer={<button className="primary" disabled={!ok} onClick={go}>{state.busy ? "Checking…" : "Unlock"}</button>}>
+      <form onSubmit={(e) => { e.preventDefault(); if (ok) go(); }}>
+        <div className="form-grid">
+          {device.repositories.length > 1 && <label className="field">Repository
+            <select value={repoId} onChange={(e) => { setRepoId(e.target.value); setAgentId(""); }}>
+              {device.repositories.map((r) => <option key={r.id} value={r.id}>{r.name} ({r.images} backups){unlockedUntil(r.id) ? " · unlocked" : ""}</option>)}
+            </select></label>}
+          <label className="field">Passphrase of {repo?.name ?? "the repository"}<input type="password" autoFocus value={pass} onChange={(e) => setPass(e.target.value)} autoComplete="off" /></label>
+          <label className="field">Your password<input type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" /></label>
+          {needCode && <label className="field">Authenticator code<input inputMode="numeric" maxLength={6} value={code} onChange={(e) => setCode(e.target.value.replace(/\D/g, ""))} autoComplete="one-time-code" /></label>}
+          {checkers.length > 1 && <label className="field">Checked by
+            <select value={checker?.id ?? ""} onChange={(e) => setAgentId(e.target.value)}>
+              {checkers.map((a) => <option key={a.id} value={a.id} disabled={!a.online}>{a.name}{a.online ? "" : " (offline)"}</option>)}
+            </select></label>}
+        </div>
+        <button type="submit" hidden />
+      </form>
+      {!checker && <ErrorNote error={checkers.length ? "No machine with access to this repository is online to check the passphrase." : "No machine has access to this repository."} />}
+      <p className="small muted">The passphrase is encrypted in this browser for {checker?.name ?? "a machine with access"}, which tries it on the repository; this server never sees it. Unlocked for 30 minutes in this browser tab.</p>
+      {state.busy && <p role="status" className="small">{state.busy}</p>}
+      {state.err && <ErrorNote error={state.err} />}
+    </Modal>
+  );
+}
+
+/** Applications the snapshot was coordinated with (Windows VSS writers), or how many were not. */
+function AppsLine({ apps }: { apps?: ImageApp[] }) {
+  if (!apps || apps.length === 0) return null;
+  const pretty = (w: string) => w.replace(/^Microsoft /, "").replace(/ VSS Writer$| Writer$/i, "").replace(/^SqlServerWriter$/, "SQL Server");
+  const missing = apps.filter((a) => !a.included);
+  const named = [...new Set(apps.map((a) => pretty(a.writer)))].filter((w) => /SQL|Exchange|Hyper-V|NTDS|Active Directory|DHCP|SharePoint|Oracle|MySQL|DFS/i.test(w));
+  const title = apps.map((a) => `${a.included ? "✓" : "✗"} ${pretty(a.writer)}: ${a.caption || a.component}${a.note ? ` (${a.note})` : ""}`).join("\n");
+  return <div className="small muted" title={title}>{missing.length
+    ? <span style={{ color: "#fcd34d" }}>{missing.length} application component{missing.length === 1 ? "" : "s"} not coordinated</span>
+    : <>apps: {named.length ? named.join(", ") : "Windows system state"}</>}</div>;
 }
 
 function RestoreDialog({ image, agents, repos, onClose }: { image: Image; agents: BackupAgent[]; repos: Repo[]; onClose: () => void }) {
@@ -698,7 +963,8 @@ function RestoreDialog({ image, agents, repos, onClose }: { image: Image; agents
   const [device, setDevice] = useState("");
   const [confirm, setConfirm] = useState("");
   const [disk, setDisk] = useState(0);
-  const target = type === "vhdx" ? { type, directory } : type === "hyperv_vm" ? { type, name: vmName, directory, start: false } : { type, device, disk, confirm };
+  const [grow, setGrow] = useState(true);
+  const target = type === "vhdx" ? { type, directory } : type === "hyperv_vm" ? { type, name: vmName, directory, start: false } : { type, device, disk, confirm, grow };
   const ok = type === "disk" ? device && confirm === device : directory.trim() && (type !== "hyperv_vm" || vmName.trim());
   const go = () => run(async () => {
     if (needsAccess && agent) {
@@ -711,7 +977,7 @@ function RestoreDialog({ image, agents, repos, onClose }: { image: Image; agents
     <Modal wide title={`Restore ${image.vmName ?? image.hostname} from ${unixTime(image.created)}`} onClose={onClose}
       footer={<button className={type === "disk" ? "danger" : "primary"} disabled={busy || !ok || !agentId || (needsAccess && !pass)} onClick={go}>{type === "disk" ? "Overwrite the disk" : needsAccess ? "Give access and restore" : "Restore"}</button>}>
       <div className="form-grid">
-        <label className="field">Machine that restores<select value={agentId} onChange={(e) => setAgentId(e.target.value)}>{pool.map((a) => <option key={a.id} value={a.id}>{a.name}{a.capabilities.includes("restore_hyperv") ? " · Hyper-V" : ""}{hasAccess(a.id) ? "" : " · no access yet"}</option>)}</select></label>
+        <label className="field">Machine that restores<select value={agentId} onChange={(e) => setAgentId(e.target.value)}>{pool.map((a) => <option key={a.id} value={a.id}>{a.name}{a.capabilities.includes("restore_hyperv") ? " · Hyper-V" : ""}{a.role === "recovery" ? " · recovery session" : ""}{hasAccess(a.id) ? "" : " · no access yet"}</option>)}</select></label>
         <label className="field">Restore to<select value={type} onChange={(e) => setType(e.target.value)}>
           {caps.includes("restore_vhdx") && <option value="vhdx">Virtual disk files (VHDX)</option>}
           {caps.includes("restore_hyperv") && <option value="hyperv_vm">A new Hyper-V VM</option>}
@@ -721,7 +987,11 @@ function RestoreDialog({ image, agents, repos, onClose }: { image: Image; agents
         {type === "hyperv_vm" && <label className="field">VM name<input value={vmName} onChange={(e) => setVmName(e.target.value)} /></label>}
         {type === "disk" && <>
           <label className="field">Image disk<select value={disk} onChange={(e) => setDisk(Number(e.target.value))}>{(image.disks.length ? image.disks : [{}]).map((d: any, i: number) => <option key={i} value={i}>Disk {i}{d.size ? ` (${bytes(d.size)})` : ""}</option>)}</select></label>
-          <label className="field">Target device<input value={device} onChange={(e) => setDevice(e.target.value)} placeholder="\\.\PhysicalDrive1 or /dev/sdb" /></label>
+          {(agent?.diskInfo ?? []).some((d) => !d.system && !d.inUse) && <label className="field">Disk on {agent?.name}<select value={device} onChange={(e) => { setDevice(e.target.value); setConfirm(""); }}>
+            <option value="">Choose…</option>
+            {(agent?.diskInfo ?? []).filter((d) => !d.system && !d.inUse).map((d) => <option key={d.path} value={d.path}>{d.path} · {bytes(d.size)}{d.model ? ` · ${d.model}` : ""}{d.serial ? ` · ${d.serial}` : ""}</option>)}
+          </select></label>}
+          <label className="field">Target device<input value={device} onChange={(e) => { setDevice(e.target.value); setConfirm(""); }} placeholder="\\.\PhysicalDrive1 or /dev/sdb" /></label>
         </>}
       </div>
       {needsAccess && (
@@ -734,6 +1004,13 @@ function RestoreDialog({ image, agents, repos, onClose }: { image: Image; agents
           <p className="small muted">Encrypted in this browser for {agent?.name} only.</p>
         </div>
       )}
+      {type === "disk" && agent?.role === "recovery" && agent.firmware && <p className="small muted" style={{ marginTop: 8 }}>
+        {agent.name} started in {agent.firmware === "uefi" ? `UEFI mode${agent.secureBoot ? " with Secure Boot" : ""}` : "legacy BIOS mode"}. The disk may be larger, or smaller if the backed-up partitions fit; a UEFI system gets the fallback boot loader and a firmware boot entry, and the job says if the firmware mode must be changed.
+      </p>}
+      {type === "disk" && <label className="row small" style={{ gap: 6, marginTop: 8 }}>
+        <input type="checkbox" checked={grow} onChange={(e) => setGrow(e.target.checked)} />
+        Use the whole disk: on a larger disk the last partition gets the extra space and its file system is grown (NTFS, ext4, LVM; XFS and Btrfs once mounted)
+      </label>}
       {type === "disk" && <div className="card warn-card" style={{ marginTop: 10 }}>
         Everything on <b className="mono">{device || "the target device"}</b> is replaced. Type the device again to confirm. You will also be asked for your password.
         <input style={{ marginTop: 6, width: "100%" }} value={confirm} onChange={(e) => setConfirm(e.target.value)} placeholder={device} />
@@ -859,6 +1136,36 @@ function Activity() {
 // ---------------------------------------------------------------- device page
 
 /** The Backup section of a device: its backup agent (if installed), images and recent jobs, or an install button. */
+/** A machine's backups on its device page: the same lock as Images & restore. */
+function MachineImages({ agent }: { agent: BackupAgent }) {
+  const q = { tenantId: agent.tenantId };
+  const tick = useUnlocks();
+  const devices = useListData<ImageDevice>("backup/image-devices", q, [agent.tenantId, tick]);
+  const agents = useListData<BackupAgent>("backup/agents", q, [agent.tenantId]);
+  const repos = useListData<Repo>("backup/repositories", q, [agent.tenantId]);
+  const [open, setOpen] = useState<string | null>(null);
+  const [asking, setAsking] = useState<ImageDevice | null>(null);
+  const mine = (devices.data ?? []).filter((d) => d.agentId === agent.id);
+  const isOpen = (d: ImageDevice) => d.repositories.some((r) => unlockedUntil(r.id));
+  const current = mine.find((d) => d.key === open);
+  if (current && isOpen(current)) {
+    return <DeviceImages device={current} agents={agents.data ?? []} repos={repos.data ?? []} onBack={() => setOpen(null)} onUnlock={() => setAsking(current)} />;
+  }
+  return (
+    <div className="card">
+      <h3>Images</h3>
+      <Table rows={devices.data ? mine : null} empty="No images yet. Create a plan on the Backups page." onRow={(d) => (isOpen(d) ? setOpen(d.key) : setAsking(d))}
+        columns={[
+          { key: "name", label: "Backed up", render: (d) => <b>{d.vmName ? `${d.vmName} (VM)` : "This machine"}</b> },
+          { key: "images", label: "Backups", render: (d) => d.images },
+          { key: "last", label: "Latest", render: (d) => unixTime(d.lastCreated) },
+          { key: "lock", label: "", render: (d) => isOpen(d) ? <Pill value="Unlocked" tone="good" /> : <button className="small">🔒 Open</button> },
+        ]} />
+      {asking && <UnlockDialog device={asking} agents={agents.data ?? []} repos={repos.data ?? []} onClose={(ok) => { const d = asking; setAsking(null); if (ok) setOpen(d.key); }} />}
+    </div>
+  );
+}
+
 export function DeviceBackup({ device }: { device: { id: string; hostname: string; platform: string; osVersion?: string } }) {
   const { can } = useApp();
   const { run, busy } = useAction();
@@ -867,7 +1174,6 @@ export function DeviceBackup({ device }: { device: { id: string; hostname: strin
   const detail = useData<any>(agent ? `backup/agents/${agent.id}` : null, {}, [agent?.id]);
   const [role, setRole] = useState(/server/i.test(device.osVersion ?? "") || device.platform === "linux" ? "server" : "workstation");
   const [sent, setSent] = useState(false);
-  const [files, setFiles] = useState<Image | null>(null);
   useAutoRefresh(agents.reload, 15000);
   if (agents.data == null) return <div className="empty">Loading…</div>;
   if (!agent) return (
@@ -891,20 +1197,10 @@ export function DeviceBackup({ device }: { device: { id: string; hostname: strin
       <div className="grid k4" style={{ marginBottom: 14 }}>
         <Stat label="Backup agent" value={agent.online ? "Online" : "Offline"} hint={`version ${agent.agentVersion}`} />
         <Stat label="Last backup" value={agent.lastBackup ? agent.lastBackup.state : "never"} hint={agent.lastBackup ? ago(agent.lastBackup.at) : undefined} accent={agent.lastBackup?.state === "failed" ? "bad" : undefined} />
-        <Stat label="Images" value={detail.data?.images?.length ?? "—"} />
+        <Stat label="Images" value={detail.data?.imageCount ?? "—"} />
         <Stat label="Plans" value={detail.data?.plans?.length ?? "—"} hint={detail.data?.plans?.map((p: Plan) => describeSchedule(p.schedule)).join(", ")} to="/backups" />
       </div>
-      <div className="card">
-        <h3>Images</h3>
-        <Table rows={detail.data?.images ?? null} empty="No images yet. Create a plan on the Backups page." columns={[
-          { key: "created", label: "Taken", render: (i: Image) => unixTime(i.created) },
-          { key: "kind", label: "Type", render: (i: Image) => `${i.kind}${i.vmName ? ` · ${i.vmName}` : ""}` },
-          { key: "size", label: "Size", render: (i: Image) => bytes(i.capturedBytes) },
-          { key: "boot", label: "Boots?", render: (i: Image) => i.lastBootCheck ? <Pill value={i.lastBootCheck.outcome} tone={i.lastBootCheck.outcome === "failed" ? "bad" : "good"} /> : "—" },
-          { key: "files", label: "", render: (i: Image) => can("scripts") && <button className="small" onClick={() => setFiles(i)}>Browse files</button> },
-        ]} />
-        {files && <FileBrowser image={files} onClose={() => setFiles(null)} />}
-      </div>
+      <MachineImages agent={agent} />
       <div className="card"><h3>Recent backup jobs</h3><JobsTable rows={detail.data?.jobs ?? null} /></div>
     </>
   );
